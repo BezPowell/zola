@@ -1,9 +1,10 @@
-use std::fs;
+use fs_err as fs;
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use ahash::{HashMap, HashSet};
-use config::Config;
+use config::{Config, ImageEncoderConfig};
 use errors::{Context, Result, anyhow};
 use image::codecs::avif::AvifEncoder;
 use image::codecs::jpeg::JpegEncoder;
@@ -12,6 +13,10 @@ use image::codecs::webp::WebPEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use image::{EncodableLayout, ImageEncoder};
+use perceptual_image::PerceptualCompressor;
+use perceptual_image::encoders::{
+    JPEGQUALITY, PerceptualAVIFEncoder, PerceptualJpegEncoder, PerceptualWebPEncoder,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -37,7 +42,7 @@ pub struct ImageOp {
 }
 
 impl ImageOp {
-    fn perform(&self) -> Result<()> {
+    fn perform(&self, config: &ImageEncoderConfig) -> Result<()> {
         if self.ignore {
             return Ok(());
         }
@@ -85,9 +90,24 @@ impl ImageOp {
                 img.write_with_encoder(encoder)?;
             }
             Format::Jpeg { quality } => {
-                let mut encoder = JpegEncoder::new_with_quality(&mut tmp_output_writer, quality);
-                add_color_profile(&mut encoder);
-                encoder.encode_image(&img)?;
+                if let Some(conf) = &config.jpeg
+                    && conf.encode_iterations > 1
+                {
+                    // If perceptual compression is enabled in config do that..
+                    let target = JPEGQUALITY.get(&quality).expect("Unsupported jpeg quality");
+                    let encoder =
+                        PerceptualJpegEncoder::new_with_min_max(conf.min_quality, conf.max_quality);
+                    PerceptualCompressor::new(&img)
+                        .target_score(*target)
+                        .max_iterations(conf.encode_iterations as usize)
+                        .encode(&mut tmp_output_writer, encoder)?;
+                } else {
+                    // ... otherwise, follow encode as usual.
+                    let mut encoder =
+                        JpegEncoder::new_with_quality(&mut tmp_output_writer, quality);
+                    add_color_profile(&mut encoder);
+                    encoder.encode_image(&img)?;
+                }
             }
             Format::WebP { quality } => {
                 // use the `image` builtin encoder for lossless, as it supports color profiles
@@ -102,27 +122,81 @@ impl ImageOp {
                             self.input_path.display()
                         );
                     }
-                    let encoder = webp::Encoder::from_image(&img)
-                        .map_err(|_| anyhow!("Unable to load this kind of image with webp"))?;
-                    let memory = match quality {
-                        Some(q) => encoder.encode(q as f32),
-                        None => encoder.encode_lossless(),
-                    };
-                    tmp_output_writer.write_all(memory.as_bytes())?;
+
+                    if let Some(conf) = &config.webp
+                        && let Some(quality) = quality
+                        && conf.encode_iterations > 1
+                    {
+                        // If perceptual compression is enabled in config do that..
+                        let target = JPEGQUALITY.get(&quality).expect("Unsupported jpeg quality");
+                        let encoder = PerceptualWebPEncoder::new_with_min_max(
+                            conf.min_quality,
+                            conf.max_quality,
+                        );
+                        PerceptualCompressor::new(&img)
+                            .target_score(*target)
+                            .max_iterations(conf.encode_iterations as usize)
+                            .encode(&mut tmp_output_writer, encoder)?;
+                    } else {
+                        // ... otherwise, follow encode as usual.
+                        let encoder = webp::Encoder::from_image(&img)
+                            .map_err(|_| anyhow!("Unable to load this kind of image with webp"))?;
+                        let memory = match quality {
+                            Some(q) => encoder.encode(q as f32),
+                            None => encoder.encode_lossless(),
+                        };
+                        tmp_output_writer.write_all(memory.as_bytes())?;
+                    }
                 }
             }
             Format::Avif { quality, speed } => {
-                let mut encoder =
-                    AvifEncoder::new_with_speed_quality(&mut tmp_output_writer, speed, quality);
-                add_color_profile(&mut encoder);
-                img.write_with_encoder(encoder)?;
+                if let Some(conf) = &config.avif
+                    && conf.encode_iterations > 1
+                {
+                    // If perceptual compression is enabled in config do that...
+                    let target = JPEGQUALITY.get(&quality).expect("Unsupported jpeg quality");
+                    let encoder = PerceptualAVIFEncoder::new_with_speed_quality(
+                        conf.min_quality,
+                        conf.max_quality,
+                        speed,
+                    );
+                    PerceptualCompressor::new(&img)
+                        .target_score(*target)
+                        .max_iterations(conf.encode_iterations as usize)
+                        .encode(&mut tmp_output_writer, encoder)?;
+                } else {
+                    // ... otherwise, follow encode as usual.
+                    let mut encoder =
+                        AvifEncoder::new_with_speed_quality(&mut tmp_output_writer, speed, quality);
+                    add_color_profile(&mut encoder);
+                    img.write_with_encoder(encoder)?;
+                }
             }
         };
 
         fs::set_permissions(&tmp_output_file, input_permissions)?;
-        fs::rename(&tmp_output_file, &self.output_path)?;
+        fs::rename(&tmp_output_file, &self.output_path(config))?;
 
         Ok(())
+    }
+
+    /// Generate output path for op.
+    fn output_path(&self, conf: &ImageEncoderConfig) -> PathBuf {
+        match self.format {
+            Format::Jpeg { quality: _ } => match &conf.jpeg {
+                Some(c) => merge_filename(&self.output_path, c),
+                None => self.output_path.clone(),
+            },
+            Format::Png => self.output_path.clone(),
+            Format::WebP { quality: _ } => match &conf.webp {
+                Some(c) => merge_filename(&self.output_path, c),
+                None => self.output_path.clone(),
+            },
+            Format::Avif { quality: _, speed: _ } => match &conf.avif {
+                Some(c) => merge_filename(&self.output_path, c),
+                None => self.output_path.clone(),
+            },
+        }
     }
 }
 
@@ -226,7 +300,7 @@ impl Processor {
     }
 
     /// Run the enqueued image operations
-    pub fn do_process(&mut self) -> Result<()> {
+    pub fn do_process(&mut self, config: &ImageEncoderConfig) -> Result<()> {
         if !self.img_ops.is_empty() {
             ufs::create_directory(&self.output_dir)?;
         }
@@ -234,7 +308,7 @@ impl Processor {
         self.img_ops
             .par_iter()
             .map(|op| {
-                op.perform().with_context(|| {
+                op.perform(config).with_context(|| {
                     format!("Failed to process image: {}", op.input_path.display())
                 })
             })
@@ -242,7 +316,7 @@ impl Processor {
     }
 
     /// Remove stale processed images in the output directory
-    pub fn prune(&self) -> Result<()> {
+    pub fn prune(&self, conf: &ImageEncoderConfig) -> Result<()> {
         // Do not create folders if they don't exist
         if !self.output_dir.exists() {
             return Ok(());
@@ -252,18 +326,38 @@ impl Processor {
         let output_paths: HashSet<_> = self
             .img_ops
             .iter()
-            .map(|o| o.output_path.file_name().unwrap().to_string_lossy())
+            .map(|o| format!("{}", o.output_path(conf).file_name().unwrap().to_string_lossy()))
             .collect();
 
         for entry in fs::read_dir(&self.output_dir)? {
             let entry_path = entry?.path();
             if entry_path.is_file() {
                 let filename = entry_path.file_name().unwrap().to_string_lossy();
-                if !output_paths.contains(&filename) {
+                if !output_paths.contains(&*filename) {
                     fs::remove_file(&entry_path)?;
                 }
             }
         }
         Ok(())
     }
+}
+
+// Merge image filename with config.
+fn merge_filename(path: &Path, conf: &impl Hash) -> PathBuf {
+    let mut hasher = std::hash::DefaultHasher::new();
+    conf.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let extension = path.extension().expect("File missing extension");
+    let filename = path.file_stem().expect("File has no name");
+
+    let mut path = path.to_path_buf();
+    path.set_file_name(format!(
+        "{}-{}.{}",
+        filename.to_string_lossy(),
+        hash,
+        extension.to_string_lossy()
+    ));
+
+    path
 }
